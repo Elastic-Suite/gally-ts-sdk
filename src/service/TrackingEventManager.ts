@@ -10,83 +10,58 @@
  */
 
 import { Client, Configuration } from '../client'
-import { TrackingEventValidator, TrackingEventType } from '../validator'
+import { TrackingEventType, TrackingEventValidator } from '../validator'
+import { ThrottledEventManager } from './tracking/ThrottledEventManager'
+import {
+  SessionInformationStorage,
+  SessionInformationCookieStorage,
+  SESSION_UID_COOKIE_NAME,
+  SESSION_VID_COOKIE_NAME,
+} from './tracking/SessionInformationStorage'
+import {
+  TrackingEventContextStorage,
+  TrackingEventContextSessionStorage,
+} from './tracking/TrackingEventContextStorage'
+import {
+  EventQueueStorage,
+  EventQueueLocalStorage,
+} from './tracking/EventQueueStorage'
 
-/**
- * Manages debouncing and throttling for event flushing.
- */
-class ThrottledEventManager {
-  private debounceTimer: NodeJS.Timeout | null = null
-  private lastFlushTime: number = 0
-  private readonly debounceMs: number
-  private readonly throttleMs: number
-  private flushCallback: (() => Promise<void>) | null = null
-
-  constructor(debounceMs: number = 300, throttleMs: number = 1000) {
-    this.debounceMs = debounceMs
-    this.throttleMs = throttleMs
-  }
-
-  /**
-   * Set the callback to be executed when flushing.
-   */
-  setFlushCallback(callback: () => Promise<void>): void {
-    this.flushCallback = callback
-  }
-
-  /**
-   * Schedule a flush with debouncing and throttling.
-   */
-  schedule(): void {
-    // Clear existing debounce timer
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer)
-    }
-
-    // Check if we should flush immediately due to throttle
-    const timeSinceLastFlush = Date.now() - this.lastFlushTime
-    const shouldFlushImmediately = timeSinceLastFlush >= this.throttleMs
-
-    if (shouldFlushImmediately) {
-      this.executeFlush()
-    } else {
-      // Schedule debounced flush
-      this.debounceTimer = setTimeout(() => {
-        this.executeFlush()
-      }, this.debounceMs)
-    }
-  }
-
-  /**
-   * Execute the flush callback and update last flush time.
-   */
-  private async executeFlush(): Promise<void> {
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer)
-      this.debounceTimer = null
-    }
-
-    this.lastFlushTime = Date.now()
-
-    if (this.flushCallback) {
-      await this.flushCallback()
-    }
-  }
-
-  /**
-   * Clear any pending timers.
-   */
-  clear(): void {
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer)
-      this.debounceTimer = null
+declare global {
+  interface Window {
+    gallyEvent: TrackingEventManager & {
+      init: typeof TrackingEventManager.init
     }
   }
 }
 
 /**
- * Common tracking event properties.
- * Shared between input and API response.
+ * Module-level reference to the real instance, captured by the Proxy closure.
+ * Kept separate from window.gallyEvent so the Proxy can safely reference it.
+ */
+let instance: TrackingEventManager | null = null
+
+if (typeof window !== 'undefined') {
+  window.gallyEvent = new Proxy(
+    {} as TrackingEventManager & { init: typeof TrackingEventManager.init },
+    {
+      get(_target, prop: string | symbol) {
+        if (prop === 'init') {
+          return TrackingEventManager.init.bind(TrackingEventManager)
+        }
+        if (instance) {
+          return (instance as unknown as Record<string | symbol, unknown>)[prop]
+        }
+        throw new Error(
+          `TrackingEventManager: tracker not initialized — call TrackingEventManager.init() first`,
+        )
+      },
+    },
+  )
+}
+
+/**
+ * Common tracking event properties shared between API response fields.
  */
 interface TrackingEventBase {
   eventType: TrackingEventType
@@ -105,8 +80,16 @@ interface TrackingEventBase {
 /**
  * TrackingEvent input type.
  * Matches the Gally createTrackingEvent GraphQL mutation input.
+ * sessionUid and sessionVid are optional here as they can be
+ * automatically populated from session storage.
  */
-type TrackingEventInput = TrackingEventBase
+type TrackingEventInput = Omit<
+  TrackingEventBase,
+  'sessionUid' | 'sessionVid'
+> & {
+  sessionUid?: string
+  sessionVid?: string
+}
 
 /**
  * TrackingEvent result type.
@@ -129,9 +112,21 @@ interface QueuedEvent {
   reject: (reason?: unknown) => void
 }
 
+interface TrackingEventManagerOptions {
+  baseUri: string
+  debounceMs?: number
+  throttleMs?: number
+  batchSize?: number
+  uidCookieMaxAge?: number
+  vidCookieMaxAge?: number
+  trackingEventContextStorage?: TrackingEventContextStorage
+  sessionInformationStorage?: SessionInformationStorage
+  eventQueueStorage?: EventQueueStorage
+}
+
 /**
- * Tracking event manager service.
- *
+
+  * Tracking event manager service. *
  * Provides methods to push tracking events (view, display, search,
  * add_to_cart, order) to the Gally API via GraphQL mutations.
  *
@@ -145,13 +140,30 @@ class TrackingEventManager {
   private eventQueue: QueuedEvent[] = []
   private readonly throttledManager: ThrottledEventManager
   private readonly batchSize: number
+  private trackingEventContextStorage: TrackingEventContextStorage
+  private sessionInformationStorage: SessionInformationStorage
+  private readonly eventQueueStorage: EventQueueStorage
 
-  constructor(
+  static init(options: TrackingEventManagerOptions): TrackingEventManager {
+    if (instance) {
+      return instance
+    }
+    const { baseUri, ...optionsRest } = options
+    const config = new Configuration({ baseUri })
+    return new TrackingEventManager(config, optionsRest)
+  }
+
+  private constructor(
     configuration: Configuration,
     options?: {
       debounceMs?: number
       throttleMs?: number
       batchSize?: number
+      uidCookieMaxAge?: number
+      vidCookieMaxAge?: number
+      trackingEventContextStorage?: TrackingEventContextStorage
+      sessionInformationStorage?: SessionInformationStorage
+      eventQueueStorage?: EventQueueStorage
     },
   ) {
     this.client = new Client(configuration)
@@ -161,19 +173,92 @@ class TrackingEventManager {
     )
     this.batchSize = options?.batchSize ?? 10
     this.throttledManager.setFlushCallback(() => this.flush())
+    this.trackingEventContextStorage =
+      options?.trackingEventContextStorage ??
+      new TrackingEventContextSessionStorage()
+    this.sessionInformationStorage =
+      options?.sessionInformationStorage ??
+      new SessionInformationCookieStorage(
+        SESSION_UID_COOKIE_NAME,
+        SESSION_VID_COOKIE_NAME,
+        options?.uidCookieMaxAge,
+        options?.vidCookieMaxAge,
+      )
+    this.eventQueueStorage =
+      options?.eventQueueStorage ?? new EventQueueLocalStorage()
+
+    this.register()
+
+    // Replay any events that were persisted but not sent before the last page unload
+    this.replayPersistedEvents()
   }
 
   /**
    * Push a tracking event to the Gally API.
    * Events are queued and batched for efficient processing.
    */
-  async pushEvent(input: TrackingEventInput): Promise<TrackingEventResponse> {
+  async push(input: TrackingEventInput): Promise<TrackingEventResponse> {
+    // Populate session information if not already provided
+    const { sessionUid, sessionVid } =
+      this.sessionInformationStorage.getSessionInformation()
+    if (!input.sessionUid) {
+      input.sessionUid = sessionUid
+    }
+    if (!input.sessionVid) {
+      input.sessionVid = sessionVid
+    }
+
+    const existingContext =
+      this.trackingEventContextStorage.getTrackingContext()
+    if (existingContext) {
+      // We don't override an existing context,
+      // But use the global one if no context was given in input
+      input = { ...existingContext, ...input }
+    }
+    // Validate the event now that we have a complete event
     TrackingEventValidator.validate(input)
+    // Update the context if the event should change it
+    this.trackingEventContextStorage.checkAndUpdateContext(input)
+
+    // Persist the event so it can be replayed if the page unloads before flush
+    this.eventQueueStorage.enqueue(input)
 
     return new Promise((resolve, reject) => {
       this.eventQueue.push({ input, resolve, reject })
       this.scheduleFlush()
     })
+  }
+
+  /**
+   * Register this instance as the active tracker.
+   */
+  private register(): void {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    instance = this
+  }
+
+  /**
+   * Replay events that were persisted in storage but never sent
+   * (e.g. due to a page reload before the queue was flushed).
+   * These events are fire-and-forget: no promise is returned to the caller.
+   */
+  private replayPersistedEvents(): void {
+    const pending = this.eventQueueStorage.dequeueAll()
+    if (pending.length === 0) {
+      return
+    }
+
+    for (const input of pending) {
+      this.eventQueue.push({
+        input,
+        resolve: () => {},
+        reject: (err) => {
+          console.warn('[Gally] Failed to replay persisted event:', err)
+        },
+      })
+    }
+
+    this.scheduleFlush()
   }
 
   /**
@@ -197,6 +282,9 @@ class TrackingEventManager {
       const batch = this.eventQueue.splice(0, this.batchSize)
       await this.processBatch(batch)
     }
+
+    // All events have been sent — clear the persistent queue
+    this.eventQueueStorage.clear()
   }
 
   /**
@@ -275,40 +363,21 @@ class TrackingEventManager {
   async flushPending(): Promise<void> {
     await this.flush()
   }
-
-  async pushViewEvent(
-    params: Omit<TrackingEventInput, 'eventType'>,
-  ): Promise<TrackingEventResponse> {
-    return this.pushEvent({ ...params, eventType: TrackingEventType.VIEW })
-  }
-
-  async pushDisplayEvent(
-    params: Omit<TrackingEventInput, 'eventType'>,
-  ): Promise<TrackingEventResponse> {
-    return this.pushEvent({ ...params, eventType: TrackingEventType.DISPLAY })
-  }
-
-  async pushSearchEvent(
-    params: Omit<TrackingEventInput, 'eventType'>,
-  ): Promise<TrackingEventResponse> {
-    return this.pushEvent({ ...params, eventType: TrackingEventType.SEARCH })
-  }
-
-  async pushAddToCartEvent(
-    params: Omit<TrackingEventInput, 'eventType'>,
-  ): Promise<TrackingEventResponse> {
-    return this.pushEvent({
-      ...params,
-      eventType: TrackingEventType.ADD_TO_CART,
-    })
-  }
-
-  async pushOrderEvent(
-    params: Omit<TrackingEventInput, 'eventType'>,
-  ): Promise<TrackingEventResponse> {
-    return this.pushEvent({ ...params, eventType: TrackingEventType.ORDER })
-  }
 }
 
-export { TrackingEventType, TrackingEventManager, ThrottledEventManager }
+export { TrackingEventType, TrackingEventManager }
 export type { TrackingEventInput, TrackingEventResponse }
+export { ThrottledEventManager } from './tracking/ThrottledEventManager'
+export {
+  SessionInformationStorage,
+  SessionInformationCookieStorage,
+} from './tracking/SessionInformationStorage'
+export type { SessionInformation } from './tracking/SessionInformationStorage'
+export {
+  TrackingEventContextStorage,
+  TrackingEventContextSessionStorage,
+} from './tracking/TrackingEventContextStorage'
+export {
+  EventQueueStorage,
+  EventQueueLocalStorage,
+} from './tracking/EventQueueStorage'
