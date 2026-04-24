@@ -137,6 +137,10 @@ const CART_FORMAT: Record<string, PayloadFieldRule> = {
       qty: { type: 'numeric', required: true },
     },
   },
+  child_sku: {
+    type: 'string',
+    required: true,
+  },
 }
 
 /**
@@ -166,6 +170,10 @@ const ORDER_ITEM_ORDER_FORMAT: Record<string, PayloadFieldRule> = {
  * Format for items in order events (purchased products).
  */
 const ORDER_ITEM_FORMAT: Record<string, PayloadFieldRule> = {
+  child_sku: {
+    type: 'string',
+    required: true,
+  },
   entityCode: { type: 'string', required: true },
   order: {
     type: 'object',
@@ -217,13 +225,6 @@ const VALIDATION_RULES: Record<TrackingEventType, EventValidationRule> = {
     extraFields: ['payload', ...SOURCE_CONTEXT_FIELDS],
     payloadShapeByMetadata: {
       '*': {
-        items: {
-          type: 'non-empty-array',
-          required: true,
-          items: ORDER_ITEM_FORMAT,
-        },
-      },
-      product: {
         ...ORDER_OBJECT_FORMAT,
         items: {
           type: 'non-empty-array',
